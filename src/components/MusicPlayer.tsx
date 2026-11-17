@@ -127,7 +127,7 @@ export function MusicPlayer({ src, title = 'Golden Brown', autoPlaySignal }: Mus
   return (
     <aside
       aria-label="Background music player"
-      className="fixed top-5 left-5 z-20 flex items-center gap-3 rounded-2xl border border-white/12 bg-[#0b0e1c]/75 px-3.5 py-2.5 text-slate-100 shadow-lg backdrop-blur-md transition-colors duration-200 hover:border-white/20 max-w-[calc(100vw-2.5rem)] sm:max-w-[290px]"
+      className="fixed top-5 left-5 z-30 flex items-center gap-3 rounded-2xl border border-white/12 bg-[#0b0e1c]/75 px-3.5 py-2.5 text-slate-100 shadow-lg backdrop-blur-md transition-colors duration-200 hover:border-white/20 max-w-[calc(100vw-2.5rem)] sm:max-w-[290px]"
     >
       <audio
         ref={audioRef}

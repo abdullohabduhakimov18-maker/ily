@@ -12,6 +12,7 @@ interface SpaceParticleCanvasProps {
   stage: ExperienceStage;
   replayNonce: number;
   onOpenEnvelope: () => void;
+  onFlowerInteract?: () => void;
 }
 
 interface StarDot {
@@ -28,10 +29,12 @@ interface StarDot {
 interface MorphParticle {
   x: number;
   y: number;
+  z: number;
   prevX: number;
   prevY: number;
   startX: number;
   startY: number;
+  startZ: number;
   r: number;
   g: number;
   b: number;
@@ -40,10 +43,14 @@ interface MorphParticle {
   startB: number;
   size: number;
   startSize: number;
+  depthShade: number;
   /** Polar state for circulating vortex */
   orbitRadius: number;
   orbitTargetRadius: number;
   orbitAngle: number;
+  orbitStartAngle: number;
+  orbitTargetAngle: number;
+  orbitSpinOffset: number;
   orbitSpeed: number;
   orbitWaveOffset: number;
   twinklePhase: number;
@@ -72,19 +79,28 @@ function easeOutQuart(t: number): number {
   return 1 - Math.pow(1 - t, 4);
 }
 
-export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: SpaceParticleCanvasProps) {
+export function SpaceParticleCanvas({
+  stage,
+  replayNonce,
+  onOpenEnvelope,
+  onFlowerInteract,
+}: SpaceParticleCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<ExperienceStage>(stage);
   const onOpenRef = useRef(onOpenEnvelope);
+  const onFlowerInteractRef = useRef(onFlowerInteract);
 
   const particlesRef = useRef<MorphParticle[]>([]);
   const targetsRef = useRef<{
     envelope: TargetPoint[];
+    envelopeFillCount: number;
     name: TargetPoint[];
     flower: TargetPoint[];
   } | null>(null);
   const starsRef = useRef<StarDot[]>([]);
   const pollenRef = useRef<PollenMote[]>([]);
+  const drawOrderRef = useRef<Int32Array>(new Int32Array(PARTICLE_COUNT));
+  const projZRef = useRef<Float32Array>(new Float32Array(PARTICLE_COUNT));
   const sizeRef = useRef({ width: 1280, height: 720 });
   const stageStartedAtRef = useRef<number>(performance.now());
   const pointerRef = useRef<{ x: number; y: number; active: boolean }>({
@@ -93,10 +109,27 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
     active: false,
   });
   const hoveredEnvelopeRef = useRef(false);
+  const flower3DRef = useRef({
+    rotX: 0.28,
+    rotY: -0.14,
+    velX: 0,
+    velY: 0,
+    hoverTiltX: 0,
+    hoverTiltY: 0,
+    zoom: 1,
+    isDragging: false,
+    lastX: 0,
+    lastY: 0,
+    touchRipple: 0,
+  });
 
   useEffect(() => {
     onOpenRef.current = onOpenEnvelope;
   }, [onOpenEnvelope]);
+
+  useEffect(() => {
+    onFlowerInteractRef.current = onFlowerInteract;
+  }, [onFlowerInteract]);
 
   // Scatter particles across space when replaying from the beginning
   useEffect(() => {
@@ -145,6 +178,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
       const p = particles[i];
       p.startX = p.x;
       p.startY = p.y;
+      p.startZ = p.z;
       p.startR = p.r;
       p.startG = p.g;
       p.startB = p.b;
@@ -155,13 +189,48 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
         const dy = p.y - cy;
         const currentR = Math.max(12, Math.hypot(dx, dy));
         p.orbitRadius = currentR;
-        // Blend particles into multi-layered celestial rings
-        const ringBand = (i % 5) * 0.14;
-        const maxOrbit = Math.min(width, height) * (0.20 + ringBand * 0.45);
-        p.orbitTargetRadius = Math.max(28, maxOrbit * (0.45 + ((i * 73) % 100) / 145));
-        p.orbitAngle = Math.atan2(dy, dx);
-        // Inner orbits spin slightly faster for natural vortex shear
-        p.orbitSpeed = (i % 2 === 0 ? 1 : 0.82) * (2.6 + (1 - Math.min(1, currentR / 300)) * 2.1);
+
+        // Distribute particles evenly across 6 concentric celestial rings with full 360-degree coverage
+        const bandCount = 6;
+        const bandIdx = i % bandCount;
+        const slotIdx = Math.floor(i / bandCount);
+        const slotsPerBand = Math.ceil(PARTICLE_COUNT / bandCount);
+
+        const baseMinR = Math.min(width, height) * 0.11;
+        const baseMaxR = Math.min(width, height) * 0.34;
+        const bandFrac = bandIdx / (bandCount - 1);
+        const radialFeather = ((((i * 73) % 100) / 100) - 0.5) * 18;
+        p.orbitTargetRadius = Math.max(26, baseMinR + (baseMaxR - baseMinR) * bandFrac + radialFeather);
+
+        const startA = Math.atan2(dy, dx);
+        const targetBaseA =
+          ((slotIdx + (bandIdx * 0.37)) / slotsPerBand) * Math.PI * 2 +
+          ((((i * 29) % 100) / 100) - 0.5) * 0.04;
+        // Pick shortest wrapped angular path so every particle flows naturally into its even slot
+        let diffA = (targetBaseA - startA) % (Math.PI * 2);
+        if (diffA > Math.PI) diffA -= Math.PI * 2;
+        if (diffA < -Math.PI) diffA += Math.PI * 2;
+
+        p.orbitStartAngle = startA;
+        p.orbitTargetAngle = startA + diffA;
+        p.orbitSpinOffset = 0;
+        p.orbitAngle = startA;
+        // Uniform band speed keeps full 360° density evenly balanced while inner rings gently shear ahead
+        p.orbitSpeed = 2.9 + (1 - bandFrac) * 1.15;
+      } else if (stage === 'flower' || stage === 'envelope') {
+        flower3DRef.current = {
+          rotX: 0.28,
+          rotY: -0.14,
+          velX: 0,
+          velY: 0,
+          hoverTiltX: 0,
+          hoverTiltY: 0,
+          zoom: 1,
+          isDragging: false,
+          lastX: 0,
+          lastY: 0,
+          touchRipple: 0,
+        };
       }
     }
   }, [stage]);
@@ -217,9 +286,13 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
 
     const rebuildTargets = (w: number, h: number) => {
       const envelope = sampleEnvelopeTargets(w, h, PARTICLE_COUNT);
+      const envelopeFillCount = envelope.reduce(
+        (acc, pt) => (pt.role === 'envelopeFill' ? acc + 1 : acc),
+        0,
+      );
       const name = sampleNameTargets('Hamidabonu', w, h, PARTICLE_COUNT);
       const flower = sampleChamomileTargets(w, h, PARTICLE_COUNT);
-      targetsRef.current = { envelope, name, flower };
+      targetsRef.current = { envelope, envelopeFillCount, name, flower };
 
       if (particlesRef.current.length === 0) {
         const initial: MorphParticle[] = [];
@@ -239,10 +312,12 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
           initial.push({
             x: sx,
             y: sy,
+            z: 0,
             prevX: sx,
             prevY: sy,
             startX: sx,
             startY: sy,
+            startZ: 0,
             r: starTint.r,
             g: starTint.g,
             b: starTint.b,
@@ -251,14 +326,19 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
             startB: starTint.b,
             size: sSize,
             startSize: sSize,
+            depthShade: 1,
             orbitRadius: 80,
             orbitTargetRadius: 120,
             orbitAngle: (i / PARTICLE_COUNT) * Math.PI * 2,
+            orbitStartAngle: (i / PARTICLE_COUNT) * Math.PI * 2,
+            orbitTargetAngle: (i / PARTICLE_COUNT) * Math.PI * 2,
+            orbitSpinOffset: 0,
             orbitSpeed: 2.5,
             orbitWaveOffset: Math.random() * Math.PI * 2,
             twinklePhase: Math.random() * Math.PI * 2,
             jitterAmp: 0.45 + Math.random() * 0.85,
           });
+          drawOrderRef.current[i] = i;
         }
         particlesRef.current = initial;
       }
@@ -295,7 +375,24 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
       });
     }
 
+    const onWindowPointerMove = (e: PointerEvent) => {
+      pointerRef.current = {
+        x: e.clientX,
+        y: e.clientY + (window.scrollY || 0),
+        active: true,
+      };
+    };
+
+    const onWindowPointerOut = (e: MouseEvent) => {
+      if (!e.relatedTarget) {
+        pointerRef.current.active = false;
+        hoveredEnvelopeRef.current = false;
+      }
+    };
+
     window.addEventListener('resize', handleResize);
+    window.addEventListener('pointermove', onWindowPointerMove, { passive: true });
+    window.addEventListener('mouseout', onWindowPointerOut, { passive: true });
 
     let lastTime = performance.now();
 
@@ -308,6 +405,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
       const { width, height } = sizeRef.current;
       const cx = width / 2;
       const cy = height * 0.45;
+      const scrollY = typeof window !== 'undefined' ? window.scrollY || 0 : 0;
       const activeStage = stageRef.current;
       const elapsedStage = (now - stageStartedAtRef.current) / 1000;
 
@@ -319,21 +417,65 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
       ctx.fillStyle = bgGrad;
       ctx.fillRect(0, 0, width, height);
 
-      // Subtle atmospheric aura behind active centerpiece
+      // Subtle atmospheric aura behind active centerpiece (scrolls with Hero)
+      ctx.save();
+      ctx.translate(0, -scrollY);
       if (activeStage === 'envelope') {
-        const heartGlow = ctx.createRadialGradient(cx, height * 0.41, 4, cx, height * 0.41, 190);
-        heartGlow.addColorStop(0, hoveredEnvelopeRef.current ? 'rgba(244, 63, 94, 0.14)' : 'rgba(244, 63, 94, 0.08)');
+        const heartGlow = ctx.createRadialGradient(cx, height * 0.41, 6, cx, height * 0.41, 240);
+        heartGlow.addColorStop(0, hoveredEnvelopeRef.current ? 'rgba(244, 63, 94, 0.22)' : 'rgba(244, 63, 94, 0.15)');
+        heartGlow.addColorStop(0.55, 'rgba(225, 29, 72, 0.06)');
         heartGlow.addColorStop(1, 'rgba(244, 63, 94, 0)');
         ctx.fillStyle = heartGlow;
         ctx.fillRect(0, 0, width, height);
+      } else if (activeStage === 'opening') {
+        const openGlowT = Math.min(1, elapsedStage / 0.9);
+        const envW = Math.min(width * 0.72, 340);
+        const envH = envW * 0.64;
+        const bodySettle = easeInOutCubic(Math.min(1, elapsedStage / 0.55));
+        const envCenterY = height * 0.40 + bodySettle * 24;
+        const envTopY = envCenterY - envH / 2;
+
+        const innerLight = ctx.createRadialGradient(cx, envTopY + 14, 6, cx, envTopY - 28, 280);
+        innerLight.addColorStop(0, `rgba(255, 224, 178, ${0.08 + openGlowT * 0.18})`);
+        innerLight.addColorStop(0.42, `rgba(244, 63, 94, ${0.14 - openGlowT * 0.04})`);
+        innerLight.addColorStop(1, 'rgba(244, 63, 94, 0)');
+        ctx.fillStyle = innerLight;
+        ctx.fillRect(0, 0, width, height);
+
+        // Delicate click-unlock shockwave ring around the heart wax seal
+        if (elapsedStage < 0.85 && !prefersReducedMotion) {
+          const ringT = easeOutQuart(elapsedStage / 0.85);
+          const ringR = 14 + ringT * (envW * 0.42);
+          const ringAlpha = (1 - ringT) * 0.42;
+          ctx.beginPath();
+          ctx.arc(cx, envCenterY + envH * 0.05, ringR, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(255, 136, 162, ${ringAlpha})`;
+          ctx.lineWidth = 1.6;
+          ctx.stroke();
+        }
+      } else if (activeStage === 'circulating') {
+        const vortexGlow = ctx.createRadialGradient(cx, cy, 10, cx, cy, 270);
+        vortexGlow.addColorStop(0, 'rgba(244, 63, 94, 0.20)');
+        vortexGlow.addColorStop(0.55, 'rgba(225, 29, 72, 0.07)');
+        vortexGlow.addColorStop(1, 'rgba(225, 29, 72, 0)');
+        ctx.fillStyle = vortexGlow;
+        ctx.fillRect(0, 0, width, height);
+      } else if (activeStage === 'name') {
+        const nameGlow = ctx.createRadialGradient(cx, height * 0.47, 12, cx, height * 0.47, 320);
+        nameGlow.addColorStop(0, 'rgba(244, 63, 94, 0.18)');
+        nameGlow.addColorStop(0.55, 'rgba(225, 29, 72, 0.06)');
+        nameGlow.addColorStop(1, 'rgba(225, 29, 72, 0)');
+        ctx.fillStyle = nameGlow;
+        ctx.fillRect(0, 0, width, height);
       } else if (activeStage === 'flower') {
-        const bloomGlow = ctx.createRadialGradient(cx, height * 0.37, 8, cx, height * 0.37, 220);
-        bloomGlow.addColorStop(0, 'rgba(250, 204, 21, 0.11)');
-        bloomGlow.addColorStop(0.55, 'rgba(255, 255, 255, 0.04)');
+        const bloomGlow = ctx.createRadialGradient(cx, height * 0.36, 8, cx, height * 0.36, 250);
+        bloomGlow.addColorStop(0, 'rgba(255, 212, 59, 0.16)');
+        bloomGlow.addColorStop(0.38, 'rgba(255, 250, 232, 0.06)');
         bloomGlow.addColorStop(1, 'rgba(0, 0, 0, 0)');
         ctx.fillStyle = bloomGlow;
         ctx.fillRect(0, 0, width, height);
       }
+      ctx.restore();
 
       // 2. Travelling space dots (3D starfield rush)
       const stars = starsRef.current;
@@ -406,10 +548,75 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
         const flowerSettled = activeStage === 'flower' ? Math.max(0, Math.min(1, (elapsedStage - 1.5) / 1.0)) : 0;
         const swayAngle = Math.sin(timeSec * 1.05) * 0.025 * flowerSettled;
 
+        // Update 3D interactive flower rotation & inertia
+        const f3d = flower3DRef.current;
+        if (activeStage === 'flower') {
+          if (!f3d.isDragging) {
+            f3d.rotY += f3d.velY;
+            f3d.rotX = Math.max(-1.15, Math.min(1.15, f3d.rotX + f3d.velX));
+            const damping = Math.pow(0.035, dt);
+            f3d.velX *= damping;
+            f3d.velY *= damping;
+            // Subtle gentle hover tilt when moving mouse or resting
+            const targetHoverY =
+              pointerRef.current.active && !prefersReducedMotion
+                ? ((pointerRef.current.x - cx) / Math.max(1, width * 0.5)) * 0.24
+                : Math.sin(timeSec * 0.55) * 0.08 * flowerSettled;
+            const targetHoverX =
+              pointerRef.current.active && !prefersReducedMotion
+                ? ((pointerRef.current.y - height * 0.37) / Math.max(1, height * 0.5)) * 0.18
+                : 0;
+            const lerpHover = 1 - Math.pow(0.015, dt);
+            f3d.hoverTiltY += (targetHoverY - f3d.hoverTiltY) * lerpHover;
+            f3d.hoverTiltX += (targetHoverX - f3d.hoverTiltX) * lerpHover;
+          }
+          f3d.touchRipple *= Math.pow(0.04, dt);
+        }
+
+        const effectiveRotY = f3d.rotY + (f3d.isDragging ? 0 : f3d.hoverTiltY);
+        const effectiveRotX = Math.max(
+          -1.25,
+          Math.min(1.25, f3d.rotX + (f3d.isDragging ? 0 : f3d.hoverTiltX)),
+        );
+        const cosRotY = Math.cos(effectiveRotY);
+        const sinRotY = Math.sin(effectiveRotY);
+        const cosRotX = Math.cos(effectiveRotX);
+        const sinRotX = Math.sin(effectiveRotX);
+        const focalLength = 540;
+
+        const projZArr = projZRef.current;
+        const drawOrder = drawOrderRef.current;
+        let envFillCounter = 0;
+
+        // Precompute shared 3D parameters for opening stage (used for both particles & front pocket occluder)
+        const openEnvW = Math.min(width * 0.72, 340);
+        const openEnvH = openEnvW * 0.64;
+        const openEnvCY = height * 0.40;
+        const openEnvTopY = openEnvCY - openEnvH / 2;
+        const openBodySettle = easeInOutCubic(Math.min(1, elapsedStage / 0.55));
+        const openHandoffT = easeInOutCubic(Math.max(0, Math.min(1, (elapsedStage - 1.88) / 0.62)));
+        const openBodyOffsetY = openBodySettle * 24 - openHandoffT * 10;
+        const openCenterY = openEnvCY + openBodyOffsetY;
+        const openHingeY = openEnvTopY + openBodyOffsetY;
+        const openPitchX = prefersReducedMotion
+          ? 0
+          : Math.sin(Math.min(1, elapsedStage / 2.2) * Math.PI) * -0.15;
+        const cosOpenPitch = Math.cos(openPitchX);
+        const sinOpenPitch = Math.sin(openPitchX);
+        const openFocal = 560;
+        const openDepthRamp = Math.min(1, elapsedStage / 0.18);
+        const openFlapT = prefersReducedMotion
+          ? 1
+          : easeInOutCubic(Math.max(0, Math.min(1, (elapsedStage - 0.16) / 0.90)));
+        const openLetterT = prefersReducedMotion
+          ? 1
+          : easeOutQuart(Math.max(0, Math.min(1, (elapsedStage - 0.62) / 1.18)));
+
         for (let i = 0; i < particles.length; i++) {
           const p = particles[i];
           p.prevX = p.x;
           p.prevY = p.y;
+          p.depthShade = 1;
 
           if (activeStage === 'envelope') {
             const tgt = targets.envelope[i];
@@ -427,129 +634,291 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
               tx = cx + (tx - cx) * boost;
               ty = heartCenterY + (ty - heartCenterY) * boost;
             } else if (hoveredEnvelopeRef.current) {
-              // Subtle magnetic lift on hover
               ty -= 4;
             }
 
-            // Gentle sweeping cosmic drift curve as space dots gather into the envelope
             const gatherSwirl = Math.sin(localT * Math.PI) * 26 * (i % 2 === 0 ? 1 : -1);
             const breatheX = Math.cos(timeSec * 1.3 + p.twinklePhase) * p.jitterAmp * 0.6;
             const breatheY = Math.sin(timeSec * 1.5 + p.twinklePhase) * p.jitterAmp * 0.6;
 
             p.x = p.startX + (tx + breatheX - p.startX) * eased + gatherSwirl * (1 - localT);
             p.y = p.startY + (ty + breatheY - p.startY) * eased;
+            p.z = 0;
             p.r = p.startR + (tgt.r - p.startR) * eased;
             p.g = p.startG + (tgt.g - p.startG) * eased;
             p.b = p.startB + (tgt.b - p.startB) * eased;
             p.size = p.startSize + (tgt.size - p.startSize) * eased;
           } else if (activeStage === 'opening') {
             const tgt = targets.envelope[i];
-            const envW = Math.min(width * 0.72, 340);
-            const envH = envW * 0.64;
-            const envTopY = height * 0.40 - envH / 2;
 
-            // Phase A (0 -> 0.82s): Red heart unseals & top flap hinges open upward in 3D
-            const flapT = prefersReducedMotion
-              ? 1
-              : easeInOutCubic(Math.min(1, elapsedStage / 0.82));
-            // Phase B (0.35s -> 1.35s): Interior letter particles glow warm & rise out of envelope
-            const letterT = easeOutQuart(Math.max(0, Math.min(1, (elapsedStage - 0.32) / 0.95)));
-
-            let tx = tgt.x;
-            let ty = tgt.y;
+            let localX = tgt.x;
+            let localY = tgt.y + openBodyOffsetY;
+            let localZ = 0;
             let tr = tgt.r;
             let tg = tgt.g;
             let tb = tgt.b;
             let tSize = tgt.size;
 
-            if (tgt.role === 'flap') {
-              // Hinge vertically around envTopY with subtle 3D foreshortening
-              const theta = flapT * Math.PI;
-              const dyFromHinge = tgt.y - envTopY;
-              const depthLift = Math.sin(theta);
-              tx = cx + (tgt.x - cx) * (1 + depthLift * 0.06);
-              ty = envTopY + dyFromHinge * Math.cos(theta) - depthLift * 8;
-              tSize = tgt.size * (1 + depthLift * 0.18);
+            if (tgt.role === 'envelope') {
+              // Back top lip sits behind emerging letter; front V-pocket walls sit cleanly in front
+              const isTopLip = tgt.y <= openEnvTopY + 5;
+              localZ = (isTopLip ? -3.5 : 4.5) * openDepthRamp;
+            } else if (tgt.role === 'flap') {
+              // Hinge strictly along (x, openHingeY, 0) so corners stay 100% locked; swing 0 -> 187 deg to rest behind letter
+              const theta = openFlapT * Math.PI * 1.04;
+              const dyFromHinge = Math.max(0, tgt.y - openEnvTopY);
+              const hingeBlend = Math.min(1, dyFromHinge / 10);
+
+              localX = tgt.x;
+              localY = openHingeY + dyFromHinge * Math.cos(theta);
+              localZ =
+                (dyFromHinge * Math.sin(theta) +
+                  ((1 - openFlapT) * 4.8 - openFlapT * 2.5) * hingeBlend) *
+                openDepthRamp *
+                (1 - openHandoffT);
+
+              // Warm light sheen across crest + gentle dim once folded behind letter
+              const crestLight = Math.max(0, Math.sin(theta));
+              const flapDim = 1 - 0.48 * openLetterT;
+              tr = Math.min(255, (tgt.r + crestLight * 26) * flapDim);
+              tg = Math.min(255, (tgt.g + crestLight * 115) * flapDim);
+              tb = Math.min(255, (tgt.b + crestLight * 95) * flapDim);
+              tSize = tgt.size * (1 + crestLight * 0.16) * (1 - 0.15 * openLetterT);
             } else if (tgt.role === 'heart') {
-              // Heart seal pulses briefly, unlocks, and lifts gracefully into rose-gold sparks
-              const unlockT = easeOutQuart(Math.min(1, elapsedStage / 1.15));
-              const spreadScale = 1 + Math.sin(Math.min(1, elapsedStage / 0.4) * Math.PI) * 0.16 + unlockT * 0.28;
-              const heartCenterY = height * 0.40 + envH * 0.05;
-              tx = cx + (tgt.x - cx) * spreadScale;
-              ty = heartCenterY + (tgt.y - heartCenterY) * spreadScale - unlockT * 36;
-              tr = tgt.r + (255 - tgt.r) * unlockT * 0.5;
-              tg = tgt.g + (165 - tgt.g) * unlockT * 0.55;
-              tb = tgt.b + (185 - tgt.b) * unlockT * 0.55;
+              // Unified wax-seal pulse followed by graceful upward rose-gold ember plume
+              const heartCenterY = openCenterY + openEnvH * 0.05;
+              const pulseT = Math.min(1, elapsedStage / 0.30);
+              const normY = Math.max(
+                0,
+                Math.min(1, (tgt.y - (openEnvCY - openEnvH * 0.25)) / Math.max(1, openEnvH * 0.45)),
+              );
+              const unlockT = easeOutQuart(
+                Math.max(0, Math.min(1, (elapsedStage - (0.18 + normY * 0.16)) / 1.15)),
+              );
+              const pulseBoost = 1 + Math.sin(pulseT * Math.PI) * 0.16;
+              const relX = (tgt.x - cx) * (pulseBoost + unlockT * 0.18);
+              const relY = (tgt.y + openBodyOffsetY - heartCenterY) * pulseBoost;
+
+              const driftX = Math.sin(unlockT * Math.PI * 1.4 + tgt.phase * 6.0) * 14 * unlockT;
+              const riseY = unlockT * (openEnvH * 0.88 + normY * 18);
+
+              localX = cx + relX + driftX;
+              localY = heartCenterY + relY - riseY;
+              localZ = (6 + Math.sin(pulseT * Math.PI) * 9 + unlockT * 8) * openDepthRamp;
+
+              tr = tgt.r + (255 - tgt.r) * unlockT * 0.65;
+              tg = tgt.g + (208 - tgt.g) * unlockT * 0.72;
+              tb = tgt.b + (202 - tgt.b) * unlockT * 0.68;
+              tSize = tgt.size * (1 + Math.sin(pulseT * Math.PI) * 0.12 - unlockT * 0.34);
             } else if (tgt.role === 'envelopeFill') {
-              // Luminous inner letter rising out from behind the opened flap
-              ty = tgt.y - letterT * (envH * 0.46);
-              tx = cx + (tgt.x - cx) * (1 - letterT * 0.08);
-              tr = tgt.r + (255 - tgt.r) * letterT;
-              tg = tgt.g + (242 - tgt.g) * letterT;
-              tb = tgt.b + (214 - tgt.b) * letterT;
-              tSize = tgt.size + letterT * 0.65;
+              // Crisp rounded-corner love letter card with mini heart crest & 3 cursive script lines
+              const fillIdx = envFillCounter++;
+              const fillTotal = Math.max(1, targets.envelopeFillCount);
+              const u = fillIdx / Math.max(1, fillTotal - 1);
+
+              const cardW = openEnvW * 0.74;
+              const cardH = openEnvH * 0.88;
+              const cardCX = cx;
+              const cardRestCY = openCenterY + openEnvH * 0.04;
+
+              let cardX = cardCX;
+              let cardY = cardRestCY;
+              let targetR = 255;
+              let targetG = 245;
+              let targetB = 224;
+              let targetDotSize = 1.25;
+
+              if (u < 0.44) {
+                // Crisp rounded-rectangle letter border
+                const pFrac = u / 0.44;
+                const halfW = cardW * 0.5;
+                const halfH = cardH * 0.5;
+                const perim = 2 * (cardW + cardH);
+                const d = pFrac * perim;
+                if (d < cardW) {
+                  cardX = cardCX - halfW + d;
+                  cardY = cardRestCY - halfH;
+                } else if (d < cardW + cardH) {
+                  cardX = cardCX + halfW;
+                  cardY = cardRestCY - halfH + (d - cardW);
+                } else if (d < 2 * cardW + cardH) {
+                  cardX = cardCX + halfW - (d - cardW - cardH);
+                  cardY = cardRestCY + halfH;
+                } else {
+                  cardX = cardCX - halfW;
+                  cardY = cardRestCY + halfH - (d - 2 * cardW - cardH);
+                }
+                // Soft rounded corner chamfer
+                const cornerX = Math.max(0, Math.abs(cardX - cardCX) - (halfW - 10));
+                const cornerY = Math.max(0, Math.abs(cardY - cardRestCY) - (halfH - 10));
+                if (cornerX > 0 && cornerY > 0) {
+                  const cr = Math.hypot(cornerX, cornerY);
+                  if (cr > 0.001) {
+                    cardX =
+                      cardCX +
+                      Math.sign(cardX - cardCX) * (halfW - 10 + (cornerX / cr) * 10);
+                    cardY =
+                      cardRestCY +
+                      Math.sign(cardY - cardRestCY) * (halfH - 10 + (cornerY / cr) * 10);
+                  }
+                }
+                targetR = 255;
+                targetG = 246;
+                targetB = 226;
+                targetDotSize = 1.32;
+              } else if (u < 0.60) {
+                // Tiny glowing rose-red heart emblem centered near the top of the letter
+                const hFrac = (u - 0.44) / 0.16;
+                const ht = hFrac * Math.PI * 2;
+                const hScale = openEnvW * 0.0023;
+                const hx = 16 * Math.pow(Math.sin(ht), 3);
+                const hy = -(
+                  13 * Math.cos(ht) -
+                  5 * Math.cos(2 * ht) -
+                  2 * Math.cos(3 * ht) -
+                  Math.cos(4 * ht)
+                );
+                cardX = cardCX + hx * hScale;
+                cardY = cardRestCY - cardH * 0.23 + hy * hScale;
+                targetR = 255;
+                targetG = 78;
+                targetB = 108;
+                targetDotSize = 1.25;
+              } else if (u < 0.86) {
+                // Three graceful calligraphic script lines below the mini-heart
+                const sFrac = (u - 0.60) / 0.26;
+                const lineIdx = Math.min(2, Math.floor(sFrac * 3));
+                const lineT = (sFrac * 3) - lineIdx;
+                const spans = [0.62, 0.54, 0.36];
+                const spanW = cardW * spans[lineIdx];
+                const waveY =
+                  Math.sin(lineT * 17 + lineIdx * 1.4) * 2.1 +
+                  Math.cos(lineT * 7.5) * 0.9;
+                cardX = cardCX + (lineT - 0.5) * spanW;
+                cardY = cardRestCY + (-0.01 + lineIdx * 0.12) * cardH + waveY;
+                targetR = 255;
+                targetG = 224;
+                targetB = 176;
+                targetDotSize = 1.18;
+              } else {
+                // Subtle warm parchment shimmer inside the card
+                const gFrac = (u - 0.86) / 0.14;
+                const gx = (((fillIdx * 37) % 100) / 100 - 0.5) * cardW * 0.82;
+                const gy = (gFrac - 0.5) * cardH * 0.78;
+                cardX = cardCX + gx;
+                cardY = cardRestCY + gy;
+                targetR = 255;
+                targetG = 240;
+                targetB = 214;
+                targetDotSize = 0.92;
+              }
+
+              const liftY = openLetterT * (openEnvH * 0.66);
+              localX = tgt.x + (cardX - tgt.x) * openLetterT;
+              localY =
+                tgt.y + openBodyOffsetY + (cardY - liftY - (tgt.y + openBodyOffsetY)) * openLetterT;
+              localZ = 1.0 * openDepthRamp;
+
+              tr = tgt.r + (targetR - tgt.r) * openLetterT;
+              tg = tgt.g + (targetG - tgt.g) * openLetterT;
+              tb = tgt.b + (targetB - tgt.b) * openLetterT;
+              tSize = tgt.size + (targetDotSize - tgt.size) * openLetterT;
             }
 
-            const settleT = Math.min(1, elapsedStage / 0.12);
-            const shimmerX = Math.cos(timeSec * 1.8 + p.twinklePhase) * 0.6;
-            const shimmerY = Math.sin(timeSec * 1.8 + p.twinklePhase) * 0.6;
+            // Apply gentle 3D envelope pitch around (cx, openCenterY, 0) + perspective
+            const relLY = localY - openCenterY;
+            const rotY3D = relLY * cosOpenPitch - localZ * sinOpenPitch;
+            const rotZ3D = relLY * sinOpenPitch + localZ * cosOpenPitch;
 
-            p.x = p.startX + (tx + shimmerX - p.startX) * settleT;
-            p.y = p.startY + (ty + shimmerY - p.startY) * settleT;
-            p.r = p.startR + (tr - p.startR) * settleT;
-            p.g = p.startG + (tg - p.startG) * settleT;
-            p.b = p.startB + (tb - p.startB) * settleT;
-            p.size = p.startSize + (tSize - p.startSize) * settleT;
+            // Smooth spiral dissolve at handoffT (1.88s..2.50s) directly into circulating vortex
+            let handoffX = localX;
+            let handoffY = openCenterY + rotY3D;
+            if (openHandoffT > 0) {
+              const dxH = handoffX - cx;
+              const dyH = handoffY - openCenterY;
+              const swirlA = openHandoffT * openHandoffT * 1.15;
+              const cosH = Math.cos(swirlA);
+              const sinH = Math.sin(swirlA);
+              const radBoost = 1 + openHandoffT * 0.22;
+              handoffX = cx + (dxH * cosH - dyH * sinH) * radBoost;
+              handoffY = openCenterY + (dxH * sinH + dyH * cosH) * radBoost - openHandoffT * 12;
+
+              tr = tr + (255 - tr) * openHandoffT * 0.8;
+              tg = tg + (76 - tg) * openHandoffT * 0.8;
+              tb = tb + (98 - tb) * openHandoffT * 0.8;
+            }
+
+            const persp = openFocal / (openFocal - Math.min(openFocal * 0.65, rotZ3D));
+            const projX = cx + (handoffX - cx) * persp;
+            const projY = openCenterY + (handoffY - openCenterY) * persp;
+
+            const shimmerX = Math.cos(timeSec * 1.8 + p.twinklePhase) * 0.32;
+            const shimmerY = Math.sin(timeSec * 1.8 + p.twinklePhase) * 0.32;
+
+            p.x = projX + shimmerX;
+            p.y = projY + shimmerY;
+            p.z = rotZ3D;
+            p.r = tr;
+            p.g = tg;
+            p.b = tb;
+            p.size = tSize * persp;
+            p.depthShade = Math.max(0.78, Math.min(1.12, 0.95 + (rotZ3D / 90) * 0.16));
+            // Sort by structural envelope layer Z so pitched bottom pocket never mis-sorts behind top of letter
+            projZArr[i] = localZ;
           } else if (activeStage === 'circulating') {
-            // Circulate envelope + heart dots into luminous swirling rings
             const swirlFactor = prefersReducedMotion ? 0.35 : 1;
-            const accel = Math.min(1, elapsedStage / 0.45);
-            p.orbitAngle += p.orbitSpeed * accel * swirlFactor * dt;
+            const accel = Math.min(1, elapsedStage / 0.40);
+            p.orbitSpinOffset += p.orbitSpeed * accel * swirlFactor * dt;
 
-            // Smoothly converge radius into harmonic orbital rings with gentle radial wave
-            const radiusEase = Math.min(1, elapsedStage / 1.1);
-            const baseR = p.orbitRadius + (p.orbitTargetRadius - p.orbitRadius) * easeInOutCubic(radiusEase);
-            const breathingR = baseR + Math.sin(timeSec * 3.4 + p.orbitWaveOffset) * 10;
+            // Smoothly disperse particles into exact 360-degree uniform orbital slots
+            const slotBlend = easeInOutCubic(Math.min(1, elapsedStage / 0.68));
+            const baseAngle =
+              p.orbitStartAngle + (p.orbitTargetAngle - p.orbitStartAngle) * slotBlend;
+            p.orbitAngle = baseAngle + p.orbitSpinOffset;
+
+            const radiusEase = Math.min(1, elapsedStage / 0.95);
+            const baseR =
+              p.orbitRadius + (p.orbitTargetRadius - p.orbitRadius) * easeInOutCubic(radiusEase);
+            const breathingR = baseR + Math.sin(timeSec * 3.2 + p.orbitWaveOffset) * 8;
 
             p.x = cx + Math.cos(p.orbitAngle) * breathingR;
-            p.y = cy + Math.sin(p.orbitAngle) * breathingR * 0.76;
+            p.y = cy + Math.sin(p.orbitAngle) * breathingR * 0.78;
+            p.z = 0;
 
-            // Shift colors into warm celestial champagne-pearl with soft rose shimmer
-            const colorT = Math.min(1, elapsedStage / 0.9);
+            const colorT = Math.min(1, elapsedStage / 0.85);
             const targetR = 255;
-            const targetG = 232 + Math.sin(p.orbitAngle * 2) * 16;
-            const targetB = 218 + Math.cos(p.orbitAngle * 2) * 24;
+            const targetG = 66 + Math.sin(p.orbitAngle * 2 + i * 0.05) * 30;
+            const targetB = 92 + Math.cos(p.orbitAngle * 2 + i * 0.05) * 32;
             p.r = p.startR + (targetR - p.startR) * colorT;
             p.g = p.startG + (targetG - p.startG) * colorT;
             p.b = p.startB + (targetB - p.startB) * colorT;
-            p.size = p.startSize + (1.75 - p.startSize) * colorT;
+            p.size = p.startSize + (1.62 - p.startSize) * colorT;
           } else if (activeStage === 'name') {
             const tgt = targets.name[i];
             const totalMorph = prefersReducedMotion ? 0.5 : 1.75;
-            // Stagger arrival gracefully left-to-right across "Hamidabonu"
             const delay = tgt.phase * 0.38;
             const localT = Math.max(0, Math.min(1, (elapsedStage - delay) / (totalMorph - 0.38)));
             const eased = easeInOutCubic(localT);
 
-            // Arc gently while coalescing out of circulation
             const swirlArc = Math.sin(localT * Math.PI) * 28 * (i % 2 === 0 ? 1 : -1);
-            const shimmerX = Math.cos(timeSec * 1.4 + p.twinklePhase) * 0.65 * eased;
-            const shimmerY = Math.sin(timeSec * 1.6 + p.twinklePhase) * 0.65 * eased;
+            const shimmerX = Math.cos(timeSec * 1.4 + p.twinklePhase) * 0.35 * eased;
+            const shimmerY = Math.sin(timeSec * 1.6 + p.twinklePhase) * 0.35 * eased;
 
             p.x = p.startX + (tgt.x - p.startX) * eased + swirlArc * (1 - localT) + shimmerX;
             p.y = p.startY + (tgt.y - p.startY) * eased + shimmerY;
+            p.z = 0;
             p.r = p.startR + (tgt.r - p.startR) * eased;
             p.g = p.startG + (tgt.g - p.startG) * eased;
             p.b = p.startB + (tgt.b - p.startB) * eased;
             p.size = p.startSize + (tgt.size - p.startSize) * eased;
           } else if (activeStage === 'flower') {
             const tgt = targets.flower[i];
-            const scale = Math.min(width * 0.32, height * 0.25, 165);
-            const flowerCY = height * 0.37;
-            const discRadius = scale * 0.24;
-            const stemStartY = flowerCY + discRadius * 0.75;
-            const stemEndY = flowerCY + scale * 1.38;
-            const pivotY = flowerCY + scale * 1.2;
+            const scale = Math.min(width * 0.34, height * 0.27, 178);
+            const flowerCY = height * 0.36;
+            const discRadius = scale * 0.255;
+            const stemStartY = flowerCY + discRadius * 0.46;
+            const stemEndY = flowerCY + scale * 1.42;
+            const pivotY = flowerCY + scale * 1.24;
 
             // Gentle botanical sway once bloom finishes
             const dxSway = tgt.x - cx;
@@ -558,19 +927,17 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
             const sinS = Math.sin(swayAngle);
             const swayedX = cx + dxSway * cosS - dySway * sinS;
             const swayedY = pivotY + dxSway * sinS + dySway * cosS;
+            const targetZ = tgt.z ?? 0;
 
             let desiredX = swayedX;
             let desiredY = swayedY;
+            let desiredZ = targetZ;
             let desiredR = tgt.r;
             let desiredG = tgt.g;
             let desiredB = tgt.b;
             let desiredSize = tgt.size;
 
             if (!prefersReducedMotion && elapsedStage < 3.4) {
-              // Phase 1 (0 -> 0.55s): Gather from Hamidabonu into a warm emerald-gold sprout base
-              // Phase 2 (0.35 -> 1.55s): Stem shoots up from root to calyx, leaves unfurl at each node
-              // Phase 3 (1.20 -> 2.15s): Golden bud swells outward in Fibonacci spiral
-              // Phase 4 (1.55 -> 3.15s): 24 white petals unfurl outward from closed bud to full bloom
               const growInfo = tgt.grow;
               const stemRiseProgress = easeInOutCubic(
                 Math.max(0, Math.min(1, (elapsedStage - 0.30) / 1.25)),
@@ -578,14 +945,14 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
               const tipY = stemEndY - stemRiseProgress * (stemEndY - stemStartY);
               const tipX =
                 cx +
-                Math.sin((1 - stemRiseProgress) * Math.PI * 1.1) * (scale * 0.08);
+                Math.sin((1 - stemRiseProgress) * Math.PI * 1.15) * (scale * 0.085);
 
               if (growInfo?.kind === 'stem') {
                 const sp = growInfo.stemProgress ?? 0;
                 if (stemRiseProgress < sp) {
-                  // Follow rising stem tip until stem reaches this particle's height
                   desiredX = tipX + (tgt.x - cx) * 0.25;
                   desiredY = tipY;
+                  desiredZ = targetZ * 0.25;
                   desiredSize = tgt.size * 0.9;
                 } else {
                   const lockT = Math.max(
@@ -594,6 +961,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
                   );
                   desiredX = tipX + (swayedX - tipX) * lockT;
                   desiredY = tipY + (swayedY - tipY) * lockT;
+                  desiredZ = targetZ * lockT;
                 }
               } else if (growInfo?.kind === 'leaf') {
                 const nodeH = growInfo.stemProgress ?? 0.5;
@@ -602,6 +970,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
                 if (stemRiseProgress < nodeH) {
                   desiredX = tipX;
                   desiredY = tipY;
+                  desiredZ = -10;
                   desiredSize = tgt.size * 0.75;
                 } else {
                   const leafGrowT = easeOutQuart(
@@ -609,6 +978,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
                   );
                   desiredX = ax + (swayedX - ax) * leafGrowT;
                   desiredY = ay + (swayedY - ay) * leafGrowT;
+                  desiredZ = -10 + (targetZ + 10) * leafGrowT;
                 }
               } else if (growInfo?.kind === 'center') {
                 const budT = easeOutQuart(
@@ -619,7 +989,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
                 const headX = elapsedStage < 1.55 ? tipX : cx;
                 desiredX = headX + (swayedX - cx) * budScale;
                 desiredY = headY + (swayedY - flowerCY) * budScale;
-                // Bud shifts from soft emerald-amber to sunlit golden yellow
+                desiredZ = targetZ * budScale;
                 desiredR = 165 + (tgt.r - 165) * budT;
                 desiredG = 215 + (tgt.g - 215) * budT;
                 desiredB = 95 + (tgt.b - 95) * budT;
@@ -629,9 +999,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
                 const bloomT = easeInOutCubic(
                   Math.max(0, Math.min(1, (elapsedStage - petalDelay) / 1.35)),
                 );
-                // Folded closed upright bud -> open radial chamomile petal
                 const targetAngle = growInfo.petalAngle ?? 0;
-                // Shortest angular path from upright bud (-PI/2)
                 let deltaA = targetAngle - -Math.PI / 2;
                 while (deltaA > Math.PI) deltaA -= Math.PI * 2;
                 while (deltaA < -Math.PI) deltaA += Math.PI * 2;
@@ -641,7 +1009,6 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
                 const headX = elapsedStage < 1.55 ? tipX : cx;
                 const radialExtend = 0.14 + 0.86 * bloomT;
 
-                // Rotate target offset smoothly around blossom center as petal unfurls
                 const relX = swayedX - cx;
                 const relY = swayedY - flowerCY;
                 const rDist = Math.hypot(relX, relY) * radialExtend;
@@ -650,65 +1017,149 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
 
                 desiredX = headX + Math.cos(finalAngle) * rDist;
                 desiredY = headY + Math.sin(finalAngle) * rDist;
+                // Folded bud sticks subtly forward before blooming outward into 3D arch
+                desiredZ = (1 - bloomT) * 14 + targetZ * bloomT;
                 desiredSize = tgt.size * (0.65 + 0.35 * bloomT);
               }
             }
 
-            // Smooth arrival from "Hamidabonu" into the growing flower choreography
+            // Apply 3D rotation around the blossom center (cx, flowerCY, 0) + zoom & touch ripple
+            const rippleLift = f3d.touchRipple * 8 * Math.sin((tgt.phase || 0) * Math.PI);
+            const lx = (desiredX - cx) * f3d.zoom;
+            const ly = (desiredY - flowerCY) * f3d.zoom;
+            const lz = (desiredZ + rippleLift) * f3d.zoom;
+
+            // Rotate around Y then X
+            const rx1 = lx * cosRotY + lz * sinRotY;
+            const rz1 = -lx * sinRotY + lz * cosRotY;
+            const ry2 = ly * cosRotX - rz1 * sinRotX;
+            const rz2 = ly * sinRotX + rz1 * cosRotX;
+
+            const clampedZ = Math.min(focalLength * 0.72, rz2);
+            const persp = focalLength / (focalLength - clampedZ);
+            const projX = cx + rx1 * persp;
+            const projY = flowerCY + ry2 * persp;
+
             const introBlend = prefersReducedMotion
               ? easeInOutCubic(Math.min(1, elapsedStage / 0.6))
               : easeInOutCubic(Math.min(1, elapsedStage / 0.72));
             const swirlArc = Math.sin(introBlend * Math.PI) * 18 * (i % 2 === 0 ? 1 : -1);
-            const shimmerX = Math.cos(timeSec * 1.2 + p.twinklePhase) * 0.55;
-            const shimmerY = Math.sin(timeSec * 1.4 + p.twinklePhase) * 0.55;
+            const shimmerX = Math.cos(timeSec * 1.2 + p.twinklePhase) * 0.5;
+            const shimmerY = Math.sin(timeSec * 1.4 + p.twinklePhase) * 0.5;
 
-            p.x = p.startX + (desiredX - p.startX) * introBlend + swirlArc * (1 - introBlend) + shimmerX;
-            p.y = p.startY + (desiredY - p.startY) * introBlend + shimmerY;
+            p.x = p.startX + (projX - p.startX) * introBlend + swirlArc * (1 - introBlend) + shimmerX;
+            p.y = p.startY + (projY - p.startY) * introBlend + shimmerY;
+            p.z = p.startZ + (clampedZ - p.startZ) * introBlend;
             p.r = p.startR + (desiredR - p.startR) * introBlend;
             p.g = p.startG + (desiredG - p.startG) * introBlend;
             p.b = p.startB + (desiredB - p.startB) * introBlend;
-            p.size = p.startSize + (desiredSize - p.startSize) * introBlend;
+            p.size = p.startSize + (desiredSize * persp - p.startSize) * introBlend;
+            p.depthShade = Math.max(0.65, Math.min(1.08, 0.88 + (clampedZ / 160) * 0.25));
+            projZArr[i] = p.z;
           }
 
-          // Pointer gentle ripple when hovering near particles
-          if (pointerRef.current.active && activeStage !== 'circulating') {
+          // Pointer gentle ripple when hovering or touching near particles
+          if (pointerRef.current.active && activeStage !== 'circulating' && !f3d.isDragging) {
             const pdx = p.x - pointerRef.current.x;
             const pdy = p.y - pointerRef.current.y;
             const distSq = pdx * pdx + pdy * pdy;
-            if (distSq < 4200 && distSq > 1) {
+            const hitRadius = activeStage === 'flower' ? 78 : 62;
+            if (distSq < hitRadius * hitRadius && distSq > 1) {
               const dist = Math.sqrt(distSq);
-              const push = (1 - dist / 65) * 5.5;
+              const push = (1 - dist / hitRadius) * (activeStage === 'flower' ? 9.5 : 5.0);
               p.x += (pdx / dist) * push;
               p.y += (pdy / dist) * push;
             }
           }
+        }
+
+        // Back-to-front depth sort in 3D opening & flower modes for authentic occlusion
+        if (activeStage === 'flower' || activeStage === 'opening') {
+          drawOrder.sort((a, b) => projZArr[a] - projZArr[b]);
+        }
+
+        const isGatheringEnvelope = activeStage === 'envelope' && elapsedStage < 2.2;
+        const isOpeningEnvelope = activeStage === 'opening';
+        const isGrowingFlower = activeStage === 'flower' && elapsedStage < 3.0;
+        let pocketOccluded = false;
+
+        const projectPocketPoint = (lx: number, ly: number, lz: number) => {
+          const relY = ly - openCenterY;
+          const ry = relY * cosOpenPitch - lz * sinOpenPitch;
+          const rz = relY * sinOpenPitch + lz * cosOpenPitch;
+          const pr = openFocal / (openFocal - Math.min(openFocal * 0.65, rz));
+          return {
+            x: cx + (lx - cx) * pr,
+            y: openCenterY + ry * pr,
+          };
+        };
+
+        ctx.save();
+        ctx.translate(0, -scrollY);
+
+        for (let k = 0; k < particles.length; k++) {
+          const i = activeStage === 'flower' || activeStage === 'opening' ? drawOrder[k] : k;
+          const p = particles[i];
+
+          // Draw dark velvet front-pocket occluder cleanly between letter (z ~ 1) and front pocket walls (z ~ 4.5)
+          if (isOpeningEnvelope && !pocketOccluded && projZArr[i] >= 3.2 * openDepthRamp && openHandoffT < 0.92) {
+            pocketOccluded = true;
+            const halfW = openEnvW * 0.5;
+            const bottomY = openCenterY + openEnvH * 0.5;
+            const notchY = openCenterY + openEnvH * 0.04;
+            const pTL = projectPocketPoint(cx - halfW, openHingeY, 3.6 * openDepthRamp);
+            const pV = projectPocketPoint(cx, notchY, 3.6 * openDepthRamp);
+            const pTR = projectPocketPoint(cx + halfW, openHingeY, 3.6 * openDepthRamp);
+            const pBR = projectPocketPoint(cx + halfW, bottomY, 3.6 * openDepthRamp);
+            const pBL = projectPocketPoint(cx - halfW, bottomY, 3.6 * openDepthRamp);
+
+            ctx.beginPath();
+            ctx.moveTo(pTL.x, pTL.y);
+            ctx.lineTo(pV.x, pV.y);
+            ctx.lineTo(pTR.x, pTR.y);
+            ctx.lineTo(pBR.x, pBR.y);
+            ctx.lineTo(pBL.x, pBL.y);
+            ctx.closePath();
+            ctx.fillStyle = `rgba(9, 11, 22, ${0.92 * (1 - openHandoffT)})`;
+            ctx.fill();
+          }
 
           const twinkle = 0.78 + 0.22 * Math.sin(timeSec * 2.6 + p.twinklePhase);
-          const pr = Math.round(p.r);
-          const pg = Math.round(p.g);
-          const pb = Math.round(p.b);
+          const shade = p.depthShade;
+          const pr = Math.min(255, Math.round(p.r * shade));
+          const pg = Math.min(255, Math.round(p.g * shade));
+          const pb = Math.min(255, Math.round(p.b * shade));
 
-          // Draw silky velocity trail while circulating, gathering envelope, or sprouting flower
-          const isGatheringEnvelope = activeStage === 'envelope' && elapsedStage < 2.2;
-          const isGrowingFlower = activeStage === 'flower' && elapsedStage < 3.0;
-          if ((activeStage === 'circulating' || isGatheringEnvelope || isGrowingFlower) && !prefersReducedMotion) {
+          // Draw silky velocity trail while circulating, gathering/opening envelope, or sprouting flower
+          if ((activeStage === 'circulating' || isGatheringEnvelope || isOpeningEnvelope || isGrowingFlower) && !prefersReducedMotion) {
             ctx.beginPath();
             ctx.moveTo(p.prevX, p.prevY);
             ctx.lineTo(p.x, p.y);
-            ctx.strokeStyle = `rgba(${pr}, ${pg}, ${pb}, ${(activeStage === 'circulating' ? 0.4 : 0.24) * twinkle})`;
-            ctx.lineWidth = p.size * 1.2;
+            ctx.strokeStyle = `rgba(${pr}, ${pg}, ${pb}, ${(activeStage === 'circulating' ? 0.4 : isOpeningEnvelope ? 0.18 : 0.24) * twinkle})`;
+            ctx.lineWidth = isOpeningEnvelope ? p.size * 0.9 : p.size * 1.2;
             ctx.stroke();
+          }
+
+          // Soft red glowing halo around envelope, circulating circle, and slender Hamidabonu particles
+          if (activeStage !== 'flower' && i % (activeStage === 'name' ? 6 : 4) === 0) {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.size * (activeStage === 'name' ? 2.4 : 3.1), 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255, 52, 86, ${(activeStage === 'name' ? 0.08 : activeStage === 'circulating' ? 0.14 : 0.11) * twinkle})`;
+            ctx.fill();
           }
 
           ctx.beginPath();
           ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-          ctx.fillStyle = `rgba(${pr}, ${pg}, ${pb}, ${0.92 * twinkle})`;
+          ctx.fillStyle = `rgba(${pr}, ${pg}, ${pb}, ${0.94 * twinkle})`;
           ctx.fill();
         }
+        ctx.restore();
       }
 
       // 4. Floating golden pollen sparkles during the chamomile flower bloom
       if (activeStage === 'flower' && elapsedStage > 2.1) {
+        ctx.save();
+        ctx.translate(0, -scrollY);
         const pollenAlphaScale = Math.min(1, (elapsedStage - 2.1) / 1.2);
         const pollen = pollenRef.current;
         for (let i = 0; i < pollen.length; i++) {
@@ -725,6 +1176,7 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
           ctx.fillStyle = `rgba(253, 224, 71, ${glow})`;
           ctx.fill();
         }
+        ctx.restore();
       }
 
       animationFrameId = requestAnimationFrame(renderFrame);
@@ -736,46 +1188,87 @@ export function SpaceParticleCanvas({ stage, replayNonce, onOpenEnvelope }: Spac
       isDisposed = true;
       cancelAnimationFrame(animationFrameId);
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('pointermove', onWindowPointerMove);
+      window.removeEventListener('mouseout', onWindowPointerOut);
     };
   }, []);
 
-  const isInsideEnvelopeHitbox = (clientX: number, clientY: number): boolean => {
-    const { width, height } = sizeRef.current;
-    const cx = width / 2;
-    const cy = height * 0.40;
-    const envW = Math.min(width * 0.72, 340);
-    const envH = envW * 0.64;
-    return (
-      Math.abs(clientX - cx) <= envW * 0.58 &&
-      Math.abs(clientY - cy) <= envH * 0.62
-    );
-  };
-
   return (
-    <canvas
-      ref={canvasRef}
-      aria-label="Interactive space particle canvas"
-      onPointerMove={(e) => {
-        pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
-        if (stageRef.current === 'envelope') {
-          const hovered = isInsideEnvelopeHitbox(e.clientX, e.clientY);
-          hoveredEnvelopeRef.current = hovered;
-          e.currentTarget.style.cursor = hovered ? 'pointer' : 'default';
-        } else {
-          hoveredEnvelopeRef.current = false;
-          e.currentTarget.style.cursor = 'default';
-        }
-      }}
-      onPointerLeave={() => {
-        pointerRef.current.active = false;
-        hoveredEnvelopeRef.current = false;
-      }}
-      onClick={(e) => {
-        if (stageRef.current === 'envelope' && isInsideEnvelopeHitbox(e.clientX, e.clientY)) {
-          onOpenRef.current();
-        }
-      }}
-      className="fixed inset-0 block w-full h-full touch-manipulation"
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        aria-label="Interactive space particle canvas"
+        className="pointer-events-none fixed inset-0 z-0 block h-full w-full"
+      />
+
+      {/* Hero-scoped interactive hitboxes so page scroll works seamlessly outside the centerpiece */}
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-[100svh]">
+        {stage === 'envelope' && (
+          <button
+            type="button"
+            aria-label="Open the envelope"
+            onClick={() => onOpenRef.current()}
+            onPointerEnter={() => {
+              hoveredEnvelopeRef.current = true;
+            }}
+            onPointerLeave={() => {
+              hoveredEnvelopeRef.current = false;
+            }}
+            className="pointer-events-auto absolute left-1/2 top-[40%] h-[min(46vw,230px)] w-[min(78vw,360px)] -translate-x-1/2 -translate-y-1/2 cursor-pointer rounded-2xl bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400/60"
+          />
+        )}
+
+        {stage === 'flower' && (
+          <div
+            aria-label="Interactive 3D chamomile flower"
+            style={{ touchAction: 'none' }}
+            className="pointer-events-auto absolute left-1/2 top-[6%] h-[56%] w-[min(86vw,390px)] -translate-x-1/2 cursor-grab active:cursor-grabbing"
+            onPointerDown={(e) => {
+              const f3d = flower3DRef.current;
+              f3d.isDragging = true;
+              f3d.lastX = e.clientX;
+              f3d.lastY = e.clientY;
+              f3d.velX = 0;
+              f3d.velY = 0;
+              f3d.touchRipple = 1;
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {
+                // Ignore capture errors on synthetic events
+              }
+              onFlowerInteractRef.current?.();
+            }}
+            onPointerMove={(e) => {
+              const f3d = flower3DRef.current;
+              if (!f3d.isDragging) return;
+              const dx = e.clientX - f3d.lastX;
+              const dy = e.clientY - f3d.lastY;
+              f3d.lastX = e.clientX;
+              f3d.lastY = e.clientY;
+              f3d.rotY += dx * 0.0095;
+              f3d.rotX = Math.max(-1.15, Math.min(1.15, f3d.rotX + dy * 0.0085));
+              f3d.velY = dx * 0.0095;
+              f3d.velX = dy * 0.0085;
+            }}
+            onPointerUp={(e) => {
+              const f3d = flower3DRef.current;
+              if (f3d.isDragging) {
+                f3d.isDragging = false;
+                try {
+                  if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  }
+                } catch {
+                  // Ignore release errors
+                }
+              }
+            }}
+            onPointerCancel={() => {
+              flower3DRef.current.isDragging = false;
+            }}
+          />
+        )}
+      </div>
+    </>
   );
 }
